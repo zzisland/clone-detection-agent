@@ -1,0 +1,44 @@
+name: Clone Detection PR Modules
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      target_path:
+        description: "Optional module directory to test, e.g. module/acisadaptor"
+        required: false
+        default: "module/acisadaptor"
+
+jobs:
+  clone-detection-pr:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Run module clone detection in mock mode
+        shell: pwsh
+        run: |
+          if ("${{ github.event.inputs.target_path }}") {
+            python scripts/run_targets.py --detector mock --target "${{ github.event.inputs.target_path }}"
+          } else {
+            python scripts/run_targets.py --detector mock
+          }
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: clone-detection-pr-reports
+          path: reports/

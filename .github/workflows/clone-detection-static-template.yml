@@ -1,0 +1,64 @@
+name: Clone Detection Scheduled Modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      detector_mode:
+        description: "mock or static"
+        required: true
+        default: "mock"
+      target_path:
+        description: "Optional single module directory to scan, e.g. module/acisadaptor"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 2 * * 1"
+
+jobs:
+  clone-detection-scheduled:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if ("${{ github.event.inputs.detector_mode }}" -eq "static") {
+            pip install clang requests
+          }
+
+      - name: Install LLVM for static mode
+        if: ${{ github.event.inputs.detector_mode == 'static' }}
+        shell: pwsh
+        run: |
+          choco install llvm -y
+          echo "LIBCLANG_FILE=C:\Program Files\LLVM\bin\libclang.dll" >> $env:GITHUB_ENV
+
+      - name: Run scheduled module clone detection
+        shell: pwsh
+        run: |
+          $mode = "${{ github.event.inputs.detector_mode }}"
+          if ([string]::IsNullOrWhiteSpace($mode)) {
+            $mode = "mock"
+          }
+
+          $target = "${{ github.event.inputs.target_path }}"
+          if ([string]::IsNullOrWhiteSpace($target)) {
+            python scripts/run_targets.py --detector $mode
+          } else {
+            python scripts/run_targets.py --detector $mode --target $target
+          }
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: clone-detection-scheduled-reports
+          path: reports/
