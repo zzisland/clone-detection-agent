@@ -6,12 +6,11 @@ from pathlib import Path
 from typing import List, Optional
 
 from models.data_model import CloneCandidate, CodeLocation
-from utils.file_utils import iter_source_files, to_posix_relative
 
 
 @dataclass(frozen=True)
 class DetectionConfig:
-    mode: str = "mock"  # mock | static
+    mode: str = "static"
     work_dir: str = "data/clone_detection"
     project_name: str = "gme"
     src_subdir: str = ""  # optional: analyze repo_path/src_subdir
@@ -26,18 +25,13 @@ class DetectionConfig:
 class CloneDetector:
     """Detector wrapper.
 
-    - mock: always runnable, returns a small set of synthetic candidates
-    - static: runs local static algorithms (slice + type12 + optional type34 + merge)
-
-    This matches the diagram's steps 3/4/5 as a single encapsulated detector.
+    Runs local static algorithms (slice + type12 + optional type34 + merge).
     """
 
     def __init__(self, config: Optional[DetectionConfig] = None):
         self.config = config or DetectionConfig()
 
     def detect(self, repo_path: Path) -> List[CloneCandidate]:
-        if self.config.mode == "mock":
-            return self._mock_detect(repo_path)
         if self.config.mode == "static":
             return self._static_detect(repo_path)
         raise ValueError(f"Unsupported detector mode: {self.config.mode}")
@@ -157,6 +151,8 @@ class CloneDetector:
                     "type12_similarity": str(row.get("type12_combined_similarity") or ""),
                     "type34_similarity": str(row.get("type34_similarity") or ""),
                     "type12_clone_type": str(row.get("type12_clone_type") or ""),
+                    "func1_body": str(row.get("func1_body") or ""),
+                    "func2_body": str(row.get("func2_body") or ""),
                 }
 
                 candidates.append(
@@ -228,39 +224,3 @@ class CloneDetector:
             return n, n
         except Exception:
             return 0, 0
-
-    def _mock_detect(self, repo_path: Path) -> List[CloneCandidate]:
-        files = iter_source_files(repo_path)
-
-        if len(files) >= 2:
-            f1, f2 = files[0], files[1]
-        elif len(files) == 1:
-            f1, f2 = files[0], files[0]
-        else:
-            f1 = repo_path / "src" / "example1.c"
-            f2 = repo_path / "src" / "example2.c"
-
-        left = CodeLocation(
-            file_path=to_posix_relative(f1, repo_path),
-            start_line=10,
-            end_line=40,
-        )
-        right = CodeLocation(
-            file_path=to_posix_relative(f2, repo_path),
-            start_line=12,
-            end_line=42,
-        )
-
-        return [
-            CloneCandidate(
-                left=left,
-                right=right,
-                similarity=0.86,
-                source_method="mock:token_similarity",
-                extra={
-                    "note": "mock candidate based on first two source files",
-                    "from_type12": "true",
-                    "from_type34": "false",
-                },
-            )
-        ]

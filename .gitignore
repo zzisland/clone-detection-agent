@@ -204,6 +204,7 @@ reports/
 data/clone_detection/
 clone_report.html
 clone_report.md
+clone_report_preview.html
 report.html
 report.md
 .cursorignore
@@ -215,3 +216,4 @@ marimo/_lsp/
 __marimo__/
 
 .idea/
+config/api-keys.json

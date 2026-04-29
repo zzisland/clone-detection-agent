@@ -23,14 +23,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--detector",
-        default="mock",
-        choices=["mock", "static"],
+        default="static",
+        choices=["static"],
         help="Detector mode forwarded to main.py",
     )
     parser.add_argument(
-        "--reports-dir",
-        default="reports",
-        help="Directory for generated markdown/html reports",
+        "--work-dir",
+        default="data/clone_detection",
+        help="Directory for detector outputs and per-module reports",
     )
     return parser.parse_args()
 
@@ -54,11 +54,7 @@ def normalize_targets(cli_targets: Iterable[str], file_targets: Iterable[str]) -
     return ordered
 
 
-def run_target(repo_root: Path, target: str, detector: str, reports_dir: Path) -> int:
-    module_name = Path(target).name
-    out_md = reports_dir / f"{module_name}_clone_report.md"
-    out_html = reports_dir / f"{module_name}_clone_report.html"
-
+def run_target(repo_root: Path, target: str, detector: str, work_dir: Path) -> int:
     cmd = [
         sys.executable,
         str(repo_root / "main.py"),
@@ -66,10 +62,8 @@ def run_target(repo_root: Path, target: str, detector: str, reports_dir: Path) -
         str(repo_root / target),
         "--detector",
         detector,
-        "--out-md",
-        str(out_md),
-        "--out-html",
-        str(out_html),
+        "--work-dir",
+        str(work_dir),
     ]
 
     print(f"[runner] scanning target: {target}")
@@ -80,8 +74,8 @@ def run_target(repo_root: Path, target: str, detector: str, reports_dir: Path) -
 def main() -> int:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
-    reports_dir = (repo_root / args.reports_dir).resolve()
-    reports_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = (repo_root / args.work_dir).resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     file_targets = load_targets((repo_root / args.targets_file).resolve())
     targets = normalize_targets(args.target, file_targets)
@@ -91,7 +85,7 @@ def main() -> int:
 
     failed: list[str] = []
     for target in targets:
-        rc = run_target(repo_root, target, args.detector, reports_dir)
+        rc = run_target(repo_root, target, args.detector, work_dir)
         if rc != 0:
             failed.append(target)
 

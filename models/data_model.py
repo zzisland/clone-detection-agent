@@ -5,12 +5,6 @@ from enum import Enum
 from typing import Dict, Optional
 
 
-class ConfidenceLabel(str, Enum):
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-
 @dataclass(frozen=True)
 class CodeLocation:
     file_path: str
@@ -52,5 +46,5 @@ class ModelEvaluation:
     judgement: ModelJudgement
     score: float  # 0..1
     explanation: str
-    model_name: str = "mock-llm"
+    model_name: str = ""
     raw: Optional[dict] = None
