@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, List
 
@@ -16,6 +17,10 @@ class ModelEvalConfig:
     temperature: float = 0.0
     timeout_seconds: int = 120
     max_body_chars: int = 4000
+    max_retries: int = 3
+    retry_backoff_seconds: float = 1.5
+    inter_request_delay_seconds: float = 0.2
+    fail_open_on_error: bool = True
 
 
 class CloneModelEvaluator:
@@ -29,6 +34,24 @@ class CloneModelEvaluator:
             return self._evaluate_openai(items)
         raise ValueError(f"Unsupported model eval mode: {self.config.mode}")
 
+    @staticmethod
+    def build_not_evaluated(items: List[LayeredClone]) -> List[ModelEvaluation]:
+        return [
+            ModelEvaluation(
+                item=item,
+                judgement=ModelJudgement.NOT_EVALUATED,
+                explanation="",
+                score=None,
+                refactor_worthiness="null",
+                refactor_reason="",
+                refactor_suggestion="",
+                risk_note="",
+                model_name="",
+                raw=None,
+            )
+            for item in items
+        ]
+
     def _evaluate_openai(self, items: List[LayeredClone]) -> List[ModelEvaluation]:
         try:
             import requests  # type: ignore
@@ -41,7 +64,11 @@ class CloneModelEvaluator:
             raise ValueError("Model eval API mode requires --model-eval-model-name")
 
         chat_url = self._normalize_api_base(self.config.api_url) + "/chat/completions"
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            # Some gateways reset long-lived keep-alive connections under load.
+            "Connection": "close",
+        }
         if self.config.api_key:
             headers["Authorization"] = (
                 self.config.api_key
@@ -62,9 +89,15 @@ class CloneModelEvaluator:
                 out.append(self._to_model_evaluation(item, parsed, raw=raw))
                 print(f"  - [model-eval] {idx}/{total} ok", flush=True)
             except Exception as e:
-                raise RuntimeError(
-                    f"Model eval API request failed for item {idx}/{total} via {chat_url}: {e}"
-                ) from e
+                if self.config.fail_open_on_error:
+                    print(f"  - [model-eval] {idx}/{total} fallback: {e}", flush=True)
+                    out.append(self._fallback_evaluation(item, str(e)))
+                else:
+                    raise RuntimeError(
+                        f"Model eval API request failed for item {idx}/{total} via {chat_url}: {e}"
+                    ) from e
+            finally:
+                self._sleep(self.config.inter_request_delay_seconds)
 
         return out
 
@@ -94,19 +127,31 @@ class CloneModelEvaluator:
                 prompt=attempt["prompt"],
                 use_response_format=bool(attempt["response_format"]),
             )
-            try:
-                resp = requests.post(chat_url, headers=headers, json=payload, timeout=self.config.timeout_seconds)
-                if resp.status_code >= 400:
-                    body = self._safe_response_text(resp)
-                    errors.append(f"{attempt['label']} -> HTTP {resp.status_code}: {body}")
-                    continue
+            for retry_index in range(self.config.max_retries + 1):
+                try:
+                    resp = requests.post(chat_url, headers=headers, json=payload, timeout=self.config.timeout_seconds)
+                    if resp.status_code >= 500:
+                        body = self._safe_response_text(resp)
+                        if retry_index < self.config.max_retries:
+                            self._sleep(self.config.retry_backoff_seconds * (retry_index + 1))
+                            continue
+                        errors.append(f"{attempt['label']} -> HTTP {resp.status_code}: {body}")
+                        break
+                    if resp.status_code >= 400:
+                        body = self._safe_response_text(resp)
+                        errors.append(f"{attempt['label']} -> HTTP {resp.status_code}: {body}")
+                        break
 
-                raw = resp.json()
-                content = self._extract_message_content(raw)
-                parsed = self._parse_model_response(content)
-                return parsed, raw
-            except Exception as e:
-                errors.append(f"{attempt['label']} -> {e}")
+                    raw = resp.json()
+                    content = self._extract_message_content(raw)
+                    parsed = self._parse_model_response(content)
+                    return parsed, raw
+                except Exception as e:
+                    if retry_index < self.config.max_retries:
+                        self._sleep(self.config.retry_backoff_seconds * (retry_index + 1))
+                        continue
+                    errors.append(f"{attempt['label']} -> {e}")
+                    break
 
         raise RuntimeError(" ; ".join(errors))
 
@@ -136,10 +181,16 @@ class CloneModelEvaluator:
     def _system_prompt() -> str:
         return (
             "You are evaluating whether two code fragments are clones. "
-            "Return strict JSON only with keys judgement, score, explanation. "
+            "Return strict JSON only with keys judgement, score, explanation, "
+            "refactor_worthiness, refactor_reason, refactor_suggestion, risk_note. "
             "judgement must be one of: clone, uncertain, not_clone. "
             "score must be a number between 0 and 1. "
-            "explanation should be concise and mention the strongest reason."
+            "explanation must be written in Simplified Chinese, be concise, and mention the strongest reason. "
+            "refactor_worthiness must be one of: high, medium, low. "
+            "refactor_reason must be written in Simplified Chinese and explain why the pair is or is not worth refactoring. "
+            "refactor_suggestion must be one of: extract_helper, extract_common_function, "
+            "template_generalize, keep_as_is, investigate_further. "
+            "risk_note must be written in Simplified Chinese and briefly describe the main refactoring risk."
         )
 
     def _build_user_prompt(self, item: LayeredClone, body_limit: int | None = None) -> str:
@@ -168,6 +219,11 @@ class CloneModelEvaluator:
             "- Use clone when structure and intent are clearly equivalent, even with renaming or light edits.\n"
             "- Use uncertain when signals conflict, bodies are truncated, or similarity is ambiguous.\n"
             "- Use not_clone when overlap is shallow or mostly incidental.\n"
+            "- Set refactor_worthiness to high when duplication is substantial, stable, and likely worth consolidating.\n"
+            "- Set refactor_worthiness to medium when duplication is real but the refactor payoff is moderate or context-dependent.\n"
+            "- Set refactor_worthiness to low when the pair is tiny, incidental, diverging, or should probably stay separate.\n"
+            "- Prefer keep_as_is when the pair should remain separate even if it is a clone.\n"
+            "- Write explanation, refactor_reason, and risk_note in Simplified Chinese.\n"
         )
 
     def _truncate_text(self, text: str, body_limit: int | None = None) -> str:
@@ -239,14 +295,41 @@ class CloneModelEvaluator:
         judgement = self._normalize_judgement(parsed.get("judgement"))
         score = self._normalize_score(parsed.get("score"))
         explanation = str(parsed.get("explanation") or "").strip() or "No explanation returned by model."
+        refactor_worthiness = self._normalize_refactor_worthiness(parsed.get("refactor_worthiness"))
+        refactor_reason = str(parsed.get("refactor_reason") or "").strip() or "No refactor assessment returned by model."
+        refactor_suggestion = self._normalize_refactor_suggestion(parsed.get("refactor_suggestion"))
+        risk_note = str(parsed.get("risk_note") or "").strip() or "No refactor risk note returned by model."
         return ModelEvaluation(
             item=item,
             judgement=judgement,
             score=score,
             explanation=explanation,
+            refactor_worthiness=refactor_worthiness,
+            refactor_reason=refactor_reason,
+            refactor_suggestion=refactor_suggestion,
+            risk_note=risk_note,
             model_name=self.config.model_name,
             raw=raw,
         )
+
+    def _fallback_evaluation(self, item: LayeredClone, error_message: str) -> ModelEvaluation:
+        return ModelEvaluation(
+            item=item,
+            judgement=ModelJudgement.UNCERTAIN,
+            score=0.0,
+            explanation=f"Model evaluation API failed after retries; marked uncertain. Error: {error_message}",
+            refactor_worthiness="unknown",
+            refactor_reason="Refactor assessment unavailable because model evaluation failed.",
+            refactor_suggestion="investigate_further",
+            risk_note="Unable to assess refactor risk because model evaluation failed.",
+            model_name=self.config.model_name,
+            raw={"error": error_message},
+        )
+
+    @staticmethod
+    def _sleep(seconds: float) -> None:
+        if seconds > 0:
+            time.sleep(seconds)
 
     @staticmethod
     def _normalize_judgement(value: Any) -> ModelJudgement:
@@ -269,3 +352,25 @@ class CloneModelEvaluator:
         except Exception as e:
             raise ValueError(f"Invalid model score: {value}") from e
         return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _normalize_refactor_worthiness(value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        allowed = {"high", "medium", "low"}
+        if normalized not in allowed:
+            return "unknown"
+        return normalized
+
+    @staticmethod
+    def _normalize_refactor_suggestion(value: Any) -> str:
+        normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {
+            "extract_helper",
+            "extract_common_function",
+            "template_generalize",
+            "keep_as_is",
+            "investigate_further",
+        }
+        if normalized not in allowed:
+            return "investigate_further"
+        return normalized

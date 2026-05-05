@@ -1,5 +1,6 @@
 {
   "targets": [
-    "module/acisadaptor"
+    "module/acisadaptor",
+    "module/covering"
   ]
 }

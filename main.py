@@ -9,6 +9,8 @@ from layering.layering import CloneLayerer
 from model_eval.model_eval import CloneModelEvaluator, ModelEvalConfig
 from reports import HtmlRenderer, MarkdownReporter
 
+BASE_DIR = Path(__file__).resolve().parent
+
 
 def ensure_repo_path(repo_path: str) -> Path:
     path = Path(repo_path).expanduser().resolve()
@@ -64,17 +66,37 @@ def resolve_float_option(cli_value: float, config_value: object, default_value: 
         return default_value
 
 
+def resolve_bool_option(cli_enabled: bool, config_value: object, default_value: bool) -> bool:
+    if cli_enabled:
+        return True
+    if config_value is None:
+        return default_value
+    normalized = str(config_value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default_value
+
+
+def resolve_agent_path(path_value: str) -> Path:
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (BASE_DIR / path).resolve()
+
+
 def build_report_paths(repo_path: Path, work_dir: str, out_md: str, out_html: str) -> tuple[Path, Path]:
     module_name = repo_path.name
-    report_dir = Path(work_dir).expanduser().resolve() / module_name
+    report_dir = resolve_agent_path(work_dir) / module_name
 
     if out_md.strip():
-        md_path = Path(out_md).expanduser().resolve()
+        md_path = resolve_agent_path(out_md)
     else:
         md_path = report_dir / f"{module_name}_clone_report.md"
 
     if out_html.strip():
-        html_path = Path(out_html).expanduser().resolve()
+        html_path = resolve_agent_path(out_html)
     else:
         html_path = report_dir / f"{module_name}_clone_report.html"
 
@@ -88,7 +110,7 @@ def parse_args() -> argparse.Namespace:
         "--api-config",
         dest="api_config",
         default="config/api-keys.json",
-        help="Local JSON config path for sensitive API keys (default: config/api-keys.json)",
+        help="Local JSON config path for sensitive API keys, relative paths are resolved from the agent root (default: config/api-keys.json)",
     )
 
     parser.add_argument(
@@ -102,7 +124,7 @@ def parse_args() -> argparse.Namespace:
         "--work-dir",
         dest="work_dir",
         default="data/clone_detection",
-        help="Work directory for detector intermediate outputs (default: data/clone_detection)",
+        help="Work directory for detector intermediate outputs, relative paths are resolved from the agent root (default: data/clone_detection)",
     )
     parser.add_argument(
         "--src-subdir",
@@ -214,6 +236,27 @@ def parse_args() -> argparse.Namespace:
         default=4000,
         help="Maximum number of characters from each function body sent to the model",
     )
+    parser.add_argument(
+        "--model-eval-max-retries",
+        dest="model_eval_max_retries",
+        type=int,
+        default=3,
+        help="Maximum retries per model evaluation request",
+    )
+    parser.add_argument(
+        "--model-eval-retry-backoff",
+        dest="model_eval_retry_backoff",
+        type=float,
+        default=1.5,
+        help="Base backoff seconds between model evaluation retries",
+    )
+    parser.add_argument(
+        "--model-eval-inter-request-delay",
+        dest="model_eval_inter_request_delay",
+        type=float,
+        default=0.2,
+        help="Delay in seconds between model evaluation requests",
+    )
 
     return parser.parse_args()
 
@@ -223,7 +266,8 @@ def main() -> int:
 
     print("[1/5] Validating input path...")
     repo_path = ensure_repo_path(args.repo_path)
-    api_config = load_api_keys(Path(args.api_config).expanduser().resolve())
+    api_config = load_api_keys(resolve_agent_path(args.api_config))
+    resolved_work_dir = str(resolve_agent_path(args.work_dir))
     clone_config = api_config.get("clone_detection") or {}
     model_eval_config = api_config.get("model_evaluation") or {}
     clone_api_key = first_non_empty(
@@ -237,6 +281,11 @@ def main() -> int:
     type34_model_name = first_non_empty(
         args.type34_model_name,
         str(clone_config.get("model_name") or ""),
+    )
+    type34_enabled = resolve_bool_option(
+        args.enable_type34,
+        clone_config.get("enabled"),
+        False,
     )
     model_eval_mode = resolve_option(
         args.model_eval_mode,
@@ -271,15 +320,35 @@ def main() -> int:
         model_eval_config.get("max_body_chars"),
         4000,
     )
+    model_eval_max_retries = resolve_int_option(
+        args.model_eval_max_retries,
+        model_eval_config.get("max_retries"),
+        3,
+    )
+    model_eval_retry_backoff = resolve_float_option(
+        args.model_eval_retry_backoff,
+        model_eval_config.get("retry_backoff_seconds") or model_eval_config.get("retry_backoff"),
+        1.5,
+    )
+    model_eval_inter_request_delay = resolve_float_option(
+        args.model_eval_inter_request_delay,
+        model_eval_config.get("inter_request_delay_seconds") or model_eval_config.get("inter_request_delay"),
+        0.2,
+    )
+    model_eval_enabled = resolve_bool_option(
+        False,
+        model_eval_config.get("enabled"),
+        True,
+    )
 
     print("[2/5] Running clone detector...")
     detector = CloneDetector(
         DetectionConfig(
             mode=args.detector_mode,
-            work_dir=args.work_dir,
+            work_dir=resolved_work_dir,
             src_subdir=args.src_subdir,
             project_name=args.project_name,
-            enable_type34=args.enable_type34,
+            enable_type34=type34_enabled,
             type34_api_url=type34_api_url,
             type34_model_name=type34_model_name,
             type34_api_key=clone_api_key,
@@ -296,19 +365,26 @@ def main() -> int:
     print(f"  - Layered items: {len(layered)}")
 
     print("[4/5] Model evaluation...")
-    model_evaluator = CloneModelEvaluator(
-        ModelEvalConfig(
-            mode=model_eval_mode,
-            model_name=model_eval_model_name,
-            api_url=model_eval_api_url,
-            api_key=model_eval_api_key,
-            temperature=model_eval_temperature,
-            timeout_seconds=model_eval_timeout,
-            max_body_chars=model_eval_max_body_chars,
+    if model_eval_enabled:
+        model_evaluator = CloneModelEvaluator(
+            ModelEvalConfig(
+                mode=model_eval_mode,
+                model_name=model_eval_model_name,
+                api_url=model_eval_api_url,
+                api_key=model_eval_api_key,
+                temperature=model_eval_temperature,
+                timeout_seconds=model_eval_timeout,
+                max_body_chars=model_eval_max_body_chars,
+                max_retries=model_eval_max_retries,
+                retry_backoff_seconds=model_eval_retry_backoff,
+                inter_request_delay_seconds=model_eval_inter_request_delay,
+            )
         )
-    )
-    evaluated = model_evaluator.evaluate(layered)
-    print(f"  - Model evaluated items: {len(evaluated)}")
+        evaluated = model_evaluator.evaluate(layered)
+        print(f"  - Model evaluated items: {len(evaluated)}")
+    else:
+        evaluated = CloneModelEvaluator.build_not_evaluated(layered)
+        print(f"  - Model evaluation disabled by config; marked {len(evaluated)} items as not_evaluated")
 
     print("[5/5] Writing reports...")
     md_reporter = MarkdownReporter()
@@ -316,7 +392,7 @@ def main() -> int:
 
     out_md, out_html = build_report_paths(
         repo_path=repo_path,
-        work_dir=args.work_dir,
+        work_dir=resolved_work_dir,
         out_md=args.out_md,
         out_html=args.out_html,
     )

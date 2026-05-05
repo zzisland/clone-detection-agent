@@ -38,13 +38,18 @@ class ModelJudgement(str, Enum):
     CLONE = "clone"
     NOT_CLONE = "not_clone"
     UNCERTAIN = "uncertain"
+    NOT_EVALUATED = "not_evaluated"
 
 
 @dataclass(frozen=True)
 class ModelEvaluation:
     item: LayeredClone
     judgement: ModelJudgement
-    score: float  # 0..1
     explanation: str
+    score: Optional[float] = None
+    refactor_worthiness: str = "unknown"
+    refactor_reason: str = ""
+    refactor_suggestion: str = ""
+    risk_note: str = ""
     model_name: str = ""
     raw: Optional[dict] = None
